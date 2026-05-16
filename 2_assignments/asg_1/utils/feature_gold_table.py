@@ -1,15 +1,15 @@
 import os
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sum as _sum, avg as _avg, count as _count
+from pyspark.sql.functions import col, sum as _sum, avg as _avg, last as _last
 from pyspark.sql.window import Window
 import pyspark.sql.functions as F
 
 def process_feature_gold(spark: SparkSession, datamart_silver_dir: str, datamart_gold_dir: str):
     """
     Construct the Gold Feature Store.
-    Performs Point-in-Time aggregations to avoid Data Leakage.
+    Performs Point-in-Time aggregations and ASOF joins to avoid Data Leakage.
     """
-    print("--- Processing Feature Gold Tables ---")
+    print("--- Processing Feature Gold Tables (v2.0 ASOF) ---")
     
     silver_click_path = os.path.join(datamart_silver_dir, "silver_feature_clickstream.parquet")
     silver_attr_path = os.path.join(datamart_silver_dir, "silver_feature_attributes.parquet")
@@ -23,54 +23,85 @@ def process_feature_gold(spark: SparkSession, datamart_silver_dir: str, datamart
     df_attr = spark.read.parquet(silver_attr_path).drop("ingestion_timestamp")
     df_fin = spark.read.parquet(silver_fin_path).drop("ingestion_timestamp")
     
-    # We want to create features at the Customer_ID and snapshot_date level.
-    # To prevent data leakage, we will define a rolling window for clickstream data
-    # (e.g., aggregate clicks strictly prior to or on the snapshot_date).
-    
-    # Let's get the base anchor dates from the financials table (as it represents monthly snapshots)
+    # Let's get the base anchor dates from the financials table
+    # This acts as the universe of Customer_ID and snapshot_dates we need features for
     df_base = df_fin.select("Customer_ID", "snapshot_date").distinct()
     
-    # 1. Join Attributes
-    # We use the latest attribute record <= the base snapshot_date.
-    # To keep it simple and robust against data leakage, we'll join on exact snapshot_date if they align.
-    # Assuming attributes and financials are synced monthly. If not, a window function is needed.
-    # Let's use a Window to get the most recent attribute for each base date.
+    # ---------------------------------------------------------
+    # 1. ASOF Join for Attributes
+    # We want the latest attribute record <= base snapshot_date
+    # ---------------------------------------------------------
+    # Create a union of base dates and attribute dates to define the timeline
+    df_timeline = df_base.select("Customer_ID", "snapshot_date").unionByName(
+        df_attr.select("Customer_ID", "snapshot_date")
+    ).distinct()
     
-    # Cross join strategy is too expensive. We can use a left join and fill forward using a Window, 
-    # but exact join is safer if they share the same snapshot_date schedule.
-    # We will assume they share the same monthly snapshot dates.
-    df_feat = df_base.join(df_attr, ["Customer_ID", "snapshot_date"], "left")
+    # Left join attributes onto the timeline
+    df_timeline_attr = df_timeline.join(df_attr, ["Customer_ID", "snapshot_date"], "left")
     
-    # Join Financials (which forms our base)
+    # Define a window to forward fill the latest non-null attribute
+    # ordered by snapshot_date from the beginning of history up to current row
+    w_asof = Window.partitionBy("Customer_ID").orderBy("snapshot_date").rowsBetween(Window.unboundedPreceding, Window.currentRow)
+    
+    # Forward fill all columns from df_attr
+    attr_cols = [c for c in df_attr.columns if c not in ["Customer_ID", "snapshot_date"]]
+    for c in attr_cols:
+        df_timeline_attr = df_timeline_attr.withColumn(c, _last(col(c), ignorenulls=True).over(w_asof))
+        
+    # Now join the forward-filled attributes back to our exact base dates
+    df_feat = df_base.join(df_timeline_attr, ["Customer_ID", "snapshot_date"], "inner")
+    
+    # ---------------------------------------------------------
+    # 2. Join Financials (which forms our base)
+    # Since financials defined our base dates, we can just do an exact join
+    # ---------------------------------------------------------
     df_feat = df_feat.join(df_fin, ["Customer_ID", "snapshot_date"], "left")
     
-    # Feature Engineering on Financials
     if "Outstanding_Debt" in df_feat.columns and "Annual_Income" in df_feat.columns:
         df_feat = df_feat.withColumn("Debt_to_Income", col("Outstanding_Debt") / (col("Annual_Income") + 1))
         
-    # 2. Clickstream Aggregations (Time-windowed)
-    # We want sum of fe_1 over the last 90 days. 
-    # Because clickstream could be daily, we group by Customer_ID, cast dates to timestamp, 
-    # and use a rolling window of 90 days (90 * 86400 seconds).
-    
-    # Convert dates to unix timestamps for windowing
+    # ---------------------------------------------------------
+    # 3. Dynamic Clickstream Aggregations (Time-windowed)
+    # We want sum and avg of all fe_1 to fe_20 over the last 90 days.
+    # ---------------------------------------------------------
     df_click_ts = df_click.withColumn("ts", F.unix_timestamp("snapshot_date"))
-    
     days_90 = 90 * 86400
-    w = Window.partitionBy("Customer_ID").orderBy("ts").rangeBetween(-days_90, 0)
+    w_click = Window.partitionBy("Customer_ID").orderBy("ts").rangeBetween(-days_90, 0)
     
-    df_click_agg = df_click_ts.select("Customer_ID", "snapshot_date", "ts", "fe_1", "fe_2") \
-        .withColumn("fe_1_sum_90d", _sum("fe_1").over(w)) \
-        .withColumn("fe_2_avg_90d", _avg("fe_2").over(w)) \
-        .drop("ts")
+    # Prepare the selections
+    select_exprs = [col("Customer_ID"), col("snapshot_date"), col("ts")]
+    for i in range(1, 21):
+        select_exprs.append(col(f"fe_{i}"))
+        
+    df_click_agg = df_click_ts.select(*select_exprs)
     
-    # Join the aggregated clickstream to our base feature table
-    # We only take the clickstream aggregation exactly matching the snapshot_date of the base table
-    df_gold = df_feat.join(df_click_agg.select("Customer_ID", "snapshot_date", "fe_1_sum_90d", "fe_2_avg_90d"), 
-                           ["Customer_ID", "snapshot_date"], "left")
+    # Dynamically apply rolling sum and avg for all 20 features
+    for i in range(1, 21):
+        col_name = f"fe_{i}"
+        df_click_agg = df_click_agg \
+            .withColumn(f"{col_name}_sum_90d", _sum(col_name).over(w_click)) \
+            .withColumn(f"{col_name}_avg_90d", _avg(col_name).over(w_click))
+            
+    df_click_agg = df_click_agg.drop("ts", *[f"fe_{i}" for i in range(1, 21)])
     
-    # Fill NAs for missing clickstream
-    df_gold = df_gold.fillna({"fe_1_sum_90d": 0, "fe_2_avg_90d": 0})
+    # Because there might be multiple clicks on the same snapshot_date, drop duplicates
+    df_click_agg = df_click_agg.dropDuplicates(["Customer_ID", "snapshot_date"])
+    
+    # ASOF join for clickstream aggregates to our base timeline
+    # We use the same forward-fill approach
+    df_timeline_click = df_timeline.join(df_click_agg, ["Customer_ID", "snapshot_date"], "left")
+    
+    agg_cols = [c for c in df_click_agg.columns if c not in ["Customer_ID", "snapshot_date"]]
+    for c in agg_cols:
+        # Fill forward the latest 90-day aggregation up to the anchor date
+        df_timeline_click = df_timeline_click.withColumn(c, _last(col(c), ignorenulls=True).over(w_asof))
+        
+    # Join to the final feature store
+    df_gold = df_feat.join(df_timeline_click, ["Customer_ID", "snapshot_date"], "inner")
+    
+    # Fill NAs for missing clickstream with 0 (assuming no clicks means 0)
+    fill_dict = {c: 0.0 for c in agg_cols}
+    df_gold = df_gold.fillna(fill_dict)
     
     out_path = os.path.join(datamart_gold_dir, "gold_feature_store.parquet")
     df_gold.write.mode("overwrite").parquet(out_path)

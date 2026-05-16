@@ -20,6 +20,7 @@ def process_feature_silver(spark: SparkSession, datamart_bronze_dir: str, datama
             df_click = df_click.withColumn(col_name, col(col_name).cast("double"))
         
         df_click = df_click.withColumn("snapshot_date", to_date(col("snapshot_date"), "yyyy-MM-dd"))
+        df_click = df_click.dropna(subset=["Customer_ID", "snapshot_date"])
         df_click = df_click.dropDuplicates(["Customer_ID", "snapshot_date"])
         
         out_path = os.path.join(datamart_silver_dir, "silver_feature_clickstream.parquet")
@@ -37,6 +38,7 @@ def process_feature_silver(spark: SparkSession, datamart_bronze_dir: str, datama
         df_attr = df_attr.withColumn("SSN", regexp_replace(col("SSN"), r"[^\d-]", ""))
         df_attr = df_attr.withColumn("snapshot_date", to_date(col("snapshot_date"), "yyyy-MM-dd"))
         
+        df_attr = df_attr.dropna(subset=["Customer_ID", "snapshot_date"])
         df_attr = df_attr.dropDuplicates(["Customer_ID", "snapshot_date"])
         
         out_path = os.path.join(datamart_silver_dir, "silver_feature_attributes.parquet")
@@ -67,6 +69,7 @@ def process_feature_silver(spark: SparkSession, datamart_bronze_dir: str, datama
                 df_fin = df_fin.withColumn(c, regexp_replace(col(c), r"[^\d.-]", "").cast("double"))
                 
         df_fin = df_fin.withColumn("snapshot_date", to_date(col("snapshot_date"), "yyyy-MM-dd"))
+        df_fin = df_fin.dropna(subset=["Customer_ID", "snapshot_date"])
         df_fin = df_fin.dropDuplicates(["Customer_ID", "snapshot_date"])
         
         out_path = os.path.join(datamart_silver_dir, "silver_feature_financials.parquet")
