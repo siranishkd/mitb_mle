@@ -1,1 +1,6 @@
 data/
+datamart/
+submission/
+docs/
+__pycache__/
+*.zip
